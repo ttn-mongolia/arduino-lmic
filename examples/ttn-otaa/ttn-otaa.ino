@@ -33,37 +33,46 @@
 #include <hal/hal.h>
 #include <SPI.h>
 
+#define LED_PIN A5
+
 // This EUI must be in little-endian format, so least-significant-byte
 // first. When copying an EUI from ttnctl output, this means to reverse
 // the bytes. For TTN issued EUIs the last bytes should be 0xD5, 0xB3,
 // 0x70.
-static const u1_t PROGMEM APPEUI[8]={ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+static const u1_t PROGMEM APPEUI[8]={ 0x3B, 0x65, 0x00, 0xF0, 0x7E, 0xD5, 0xB3, 0x70 };
+
 void os_getArtEui (u1_t* buf) { memcpy_P(buf, APPEUI, 8);}
 
 // This should also be in little endian format, see above.
-static const u1_t PROGMEM DEVEUI[8]={ 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+static const u1_t PROGMEM DEVEUI[8]={ 0xC3, 0x7D, 0xBC, 0xBC, 0xF0, 0xCA, 0xCE, 0x00 };
 void os_getDevEui (u1_t* buf) { memcpy_P(buf, DEVEUI, 8);}
 
 // This key should be in big endian format (or, since it is not really a
 // number but a block of memory, endianness does not really apply). In
 // practice, a key taken from ttnctl can be copied as-is.
-// The key shown here is the semtech default key.
-static const u1_t PROGMEM APPKEY[16] = { 0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6, 0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C };
+static const u1_t PROGMEM APPKEY[16] = {
+    0x7A, 0x99, 0x8B, 0xC6, 0x05, 0x7E, 0x4A, 0x40,
+    0x0D, 0xB6, 0x8B, 0x1F, 0x26, 0xB7, 0x6A, 0xE8
+};
+
 void os_getDevKey (u1_t* buf) {  memcpy_P(buf, APPKEY, 16);}
 
-static uint8_t mydata[] = "Hello, world!";
-static osjob_t sendjob;
+static struct __attribute__ ((packed)) {
+    long temp;
+    long volt;
+} mydata;
 
+static osjob_t sendjob;
 // Schedule TX every this many seconds (might become longer due to duty
 // cycle limitations).
-const unsigned TX_INTERVAL = 60;
+const unsigned TX_INTERVAL = 600;
 
 // Pin mapping
 const lmic_pinmap lmic_pins = {
-    .nss = 6,
+    .nss = 10,
     .rxtx = LMIC_UNUSED_PIN,
-    .rst = 5,
-    .dio = {2, 3, 4},
+    .rst = 9,
+    .dio = {8, 6, 7},
 };
 
 void onEvent (ev_t ev) {
@@ -101,7 +110,6 @@ void onEvent (ev_t ev) {
         case EV_REJOIN_FAILED:
             Serial.println(F("EV_REJOIN_FAILED"));
             break;
-            break;
         case EV_TXCOMPLETE:
             Serial.println(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
             if (LMIC.txrxFlags & TXRX_ACK)
@@ -113,6 +121,7 @@ void onEvent (ev_t ev) {
             }
             // Schedule next transmission
             os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(TX_INTERVAL), do_send);
+
             break;
         case EV_LOST_TSYNC:
             Serial.println(F("EV_LOST_TSYNC"));
@@ -142,7 +151,9 @@ void do_send(osjob_t* j){
         Serial.println(F("OP_TXRXPEND, not sending"));
     } else {
         // Prepare upstream data transmission at the next possible time.
-        LMIC_setTxData2(1, mydata, sizeof(mydata)-1, 0);
+        mydata.volt = readVcc();
+        mydata.temp = readTemp();
+        LMIC_setTxData2(1, (char*)&mydata, sizeof(mydata), 0);
         Serial.println(F("Packet queued"));
     }
     // Next TX is scheduled after TX_COMPLETE event.
@@ -152,22 +163,46 @@ void setup() {
     Serial.begin(9600);
     Serial.println(F("Starting"));
 
-    #ifdef VCC_ENABLE
-    // For Pinoccio Scout boards
-    pinMode(VCC_ENABLE, OUTPUT);
-    digitalWrite(VCC_ENABLE, HIGH);
-    delay(1000);
-    #endif
-
     // LMIC init
     os_init();
     // Reset the MAC state. Session and pending data transfers will be discarded.
     LMIC_reset();
 
+    LMIC_setClockError(MAX_CLOCK_ERROR * 10 / 100);
+    // LMIC.dn2Dr = DR_SF9;
+    // LMIC_setDrTxpow(DR_SF9, 14);
     // Start job (sending automatically starts OTAA too)
     do_send(&sendjob);
 }
 
 void loop() {
     os_runloop_once();
+}
+
+long readVcc()
+{
+    long result; // Read 1.1V reference against AVcc
+    ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+    delay(2); // Wait for Vref to settle
+    ADCSRA |= _BV(ADSC); // Convert
+    while (bit_is_set(ADCSRA,ADSC));
+    result = ADCL;
+    result |= ADCH<<8;
+    result = 1126400L / result; // Back-calculate AVcc in mV
+    Serial.println( result, DEC);
+    return result;
+}
+
+long readTemp()
+{
+    long result; // Read temperature sensor against 1.1V reference
+    ADMUX = _BV(REFS1) | _BV(REFS0) | _BV(MUX3);
+    delay(2); // Wait for Vref to settle
+    ADCSRA |= _BV(ADSC); // Convert
+    while (bit_is_set(ADCSRA,ADSC));
+    result = ADCL;
+    result |= ADCH<<8;
+    result = (result - 125) * 1075;
+    Serial.println( result, DEC);
+    return result;
 }
